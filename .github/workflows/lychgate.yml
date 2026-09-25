@@ -20,6 +20,9 @@ permissions:
 
 jobs:
   run:
+    # Until the App is configured there is nothing to run — and failing daily
+    # would open a failure issue every day.
+    if: vars.GK_APP_CLIENT_ID != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
