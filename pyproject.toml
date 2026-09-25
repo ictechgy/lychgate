@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "groundskeeper"
+version = "0.1.0"
+description = "Deterministic custodian for repos you stopped tending — merges safe Dependabot PRs, reports the rest."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "groundskeeper contributors" }]
+dependencies = []
+
+[project.scripts]
+groundskeeper = "groundskeeper.cli:main"
+
+[tool.setuptools]
+packages = ["groundskeeper"]

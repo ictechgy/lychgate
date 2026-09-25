@@ -1,0 +1,25 @@
+# Repos under custody. A repo's own .github/steward.yml (if present)
+# overrides its entry here; see steward.example.yml.
+defaults:
+  steward:
+    tier: 0            # observe only unless an entry opts in
+  dependencies:
+    automerge:
+      semver: [patch, minor]
+      require_checks: true
+      min_pr_age_hours: 72
+      max_per_run: 3
+
+repos:
+  # week-1 dogfood: repos with live Dependabot PRs
+  - repo: ictechgy/relay-continuity
+    steward: {status: complete, tier: 1}
+  - repo: ictechgy/multi-account-tool
+    steward: {status: complete, tier: 1}
+  - repo: ictechgy/kartograph
+    steward: {status: active, tier: 1}
+  # observe only — sunset candidates for the week-2 T3 report
+  - repo: ictechgy/filtering
+    steward: {status: sunset-candidate, tier: 0}
+  - repo: ictechgy/ictechgy.github.io
+    steward: {status: sunset-candidate, tier: 0}

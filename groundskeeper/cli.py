@@ -1,0 +1,116 @@
+"""groundskeeper run [--apply] — evaluate every registered repo, optionally
+merge what passed, append to the ledger, write the digest.
+
+Dry-run is the default. Only `--apply` ever calls a mutating API, and the
+only mutation in tier 1 is squash-merging a Dependabot PR at the exact
+head commit that was evaluated.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from . import __version__
+from .config import ConfigError, load_registry, resolve
+from .decide import plan
+from .github import GitHub, GitHubError
+from .report import render, waiting_issues
+
+STEWARD_PATHS = (".github/steward.yml", "steward.yml")
+
+
+def _steward_yml(gh: GitHub, repo: str) -> Optional[str]:
+    for path in STEWARD_PATHS:
+        text = gh.file(repo, path)
+        if text is not None:
+            return text
+    return None
+
+
+def _ledger_append(path: str, entry: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def run(args: argparse.Namespace, gh: Optional[GitHub] = None,
+        now: Optional[datetime] = None) -> int:
+    gh = gh or GitHub()
+    now = now or datetime.now(timezone.utc)
+    with open(args.registry, encoding="utf-8") as f:
+        registry = load_registry(f.read())
+
+    run_id = os.environ.get("GITHUB_RUN_ID", "local")
+    results: List[Dict[str, Any]] = []
+    exit_code = 0
+
+    for entry in registry["repos"]:
+        repo = entry["repo"]
+        if args.only and repo not in args.only:
+            continue
+        result: Dict[str, Any] = {"verdicts": [], "issues": [], "alerts": None}
+        try:
+            policy = resolve(registry, entry, _steward_yml(gh, repo))
+            result["policy"] = policy
+            if not policy.enabled:
+                result["error"] = "disabled (steward.enabled: false)"
+                results.append(result)
+                continue
+            result["verdicts"] = plan(gh.dependabot_prs(repo), policy, now)
+            owner = repo.split("/")[0]
+            result["issues"] = waiting_issues(gh.open_issues(repo), owner,
+                                              policy.respond_after_days, now)
+            result["alerts"] = gh.open_alert_count(repo)
+        except (ConfigError, GitHubError) as e:
+            result.setdefault("policy", resolve({}, {"repo": repo}, None))
+            result["error"] = str(e)
+            exit_code = 1
+            results.append(result)
+            continue
+
+        for v in result["verdicts"]:
+            if v.action != "merge" or not args.apply:
+                continue
+            entry_log = {"ts": now.isoformat(), "run": run_id, "repo": repo,
+                         "pr": v.number, "sha": v.head_sha, "level": v.level,
+                         "title": v.title}
+            try:
+                gh.merge(repo, v.number, v.head_sha)
+                _ledger_append(args.ledger, {**entry_log, "action": "merged",
+                                             "reasons": v.reasons})
+            except GitHubError as e:
+                v.action, v.reasons = "error", [f"merge failed: {e}"]
+                _ledger_append(args.ledger, {**entry_log, "action": "merge_failed",
+                                             "reasons": v.reasons})
+        results.append(result)
+
+    text = render(results, applied=args.apply, now=now)
+    if args.report:
+        with open(args.report, "w", encoding="utf-8") as f:
+            f.write(text)
+    else:
+        sys.stdout.write(text)
+    return exit_code
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(prog="groundskeeper",
+                                 description="Deterministic custodian for repos you stopped tending.")
+    ap.add_argument("--version", action="version", version=__version__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    r = sub.add_parser("run", help="evaluate registered repos (dry-run unless --apply)")
+    r.add_argument("--registry", default="registry.yml")
+    r.add_argument("--ledger", default="ledger.jsonl")
+    r.add_argument("--report", help="write the markdown digest here instead of stdout")
+    r.add_argument("--only", action="append", help="limit to owner/name (repeatable)")
+    r.add_argument("--apply", action="store_true", help="actually merge eligible PRs")
+    args = ap.parse_args(argv)
+    try:
+        return run(args)
+    except (ConfigError, OSError) as e:
+        print(f"groundskeeper: {e}", file=sys.stderr)
+        return 2

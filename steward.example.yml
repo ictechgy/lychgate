@@ -1,0 +1,17 @@
+# .github/steward.yml in a repo under custody. Changes to this file should
+# require the owner's review (CODEOWNERS + ruleset) — the steward must never
+# widen its own mandate.
+steward:
+  enabled: true
+  status: complete          # active | complete | sunset-candidate
+  tier: 1                   # 0 observe | 1 janitor (2 responder: not yet)
+
+dependencies:
+  automerge:
+    semver: [patch, minor]  # major is rejected at load time
+    require_checks: true
+    min_pr_age_hours: 72    # merge delay; pair with Dependabot `cooldown`
+    max_per_run: 3
+
+issues:
+  respond_after_days: 14    # flag unanswered external issues in the digest

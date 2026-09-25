@@ -1,0 +1,68 @@
+name: groundskeeper
+
+on:
+  schedule:
+    - cron: "17 3 * * *"   # daily; the committed digest keeps this repo "active"
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: "Actually merge eligible PRs (otherwise dry-run)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: groundskeeper
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # commit ledger.jsonl + digests/ to this control repo only
+  issues: write     # weekly digest issue in this control repo only
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: python -m unittest discover -s tests -t .
+
+      # App token: contents + pull_requests write, NO administration, NO workflows.
+      - id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.GK_APP_ID }}
+          private-key: ${{ secrets.GK_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Evaluate (and merge when applying)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APPLY: ${{ inputs.apply == true || vars.GK_APPLY == '1' }}
+        run: |
+          flag=""
+          if [ "$APPLY" = "true" ]; then flag="--apply"; fi
+          python -m groundskeeper run $flag --report report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit digest + ledger
+        if: always() && hashFiles('report.md') != ''
+        run: |
+          cp report.md "digests/$(date -u +%G-W%V).md"
+          git config user.name "groundskeeper[bot]"
+          git config user.email "groundskeeper@users.noreply.github.com"
+          git add ledger.jsonl digests/
+          git diff --cached --quiet || git commit -m "digest: $(date -u +%F)"
+          git push
+
+      - name: Weekly digest issue (Mondays)
+        if: always() && hashFiles('report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ "$(date -u +%u)" = "1" ] || exit 0
+          gh issue create --title "Digest $(date -u +%G-W%V)" --body-file report.md
