@@ -42,6 +42,7 @@ DEPENDENCY_FILES = (
     "composer.json", "composer.lock",
 )
 
+FILES_PAGE = 100
 _LEVELS = {"patch": 0, "minor": 1, "major": 2}
 _META_RE = re.compile(r"update-type:\s*version-update:semver-(patch|minor|major)")
 # Versions need a dot, so SHA pins ("from 6c977a6 to 02cb101") never parse.
@@ -61,6 +62,10 @@ class Verdict:
     reasons: List[str] = field(default_factory=list)
     level: Optional[str] = None
     age_hours: float = 0.0
+    # True when the only blockers are owner-judgment calls (workflows, semver,
+    # tier) — CI green, mergeable, nothing broken. The digest then offers a
+    # copy-paste merge command instead of just a reason.
+    owner_can_merge: bool = False
 
 
 def _version_tuple(v: str) -> Optional[Tuple[int, ...]]:
@@ -91,8 +96,7 @@ def semver_level(title: str, commit_bodies: List[str]) -> Optional[str]:
     found = []
     for body in commit_bodies:
         found.extend(_META_RE.findall(body or ""))
-    m = _TITLE_RE.search(title or "")
-    if m:
+    for m in _TITLE_RE.finditer(title or ""):
         lv = level_from_versions(m.group(1), m.group(2))
         if lv:
             found.append(lv)
@@ -148,50 +152,72 @@ def evaluate(pr: Dict[str, Any], policy: Policy, now: datetime) -> Verdict:
         v.action, v.reasons = "skip", ["draft PR"]
         return v
 
-    hold: List[str] = []
-    wait: List[str] = []
+    judgment: List[str] = []  # the owner may reasonably merge anyway
+    broken: List[str] = []    # something is actually wrong
+    wait: List[str] = []      # re-check next run
+    cooling = False
 
     if not policy.may_merge:
-        hold.append(f"policy: tier {policy.tier}, status {policy.status} — report only")
+        judgment.append(f"policy: tier {policy.tier}, status {policy.status} — report only")
+    if not v.head_sha:
+        broken.append("no head commit SHA reported")
 
-    files = [f["path"] for f in pr.get("files") or []]
+    raw_files = pr.get("files") or []
+    files = [f["path"] for f in raw_files]
     workflow_files = [p for p in files if p.startswith(".github/workflows/")]
     other = [p for p in files if p not in workflow_files and not is_dependency_file(p)]
+    if len(raw_files) >= FILES_PAGE:
+        # gh returns at most one page of files; the rest could hide anything.
+        broken.append(f"{len(raw_files)}+ changed files — list may be truncated")
     if workflow_files:
-        hold.append("touches .github/workflows — the App has no workflows permission; owner merges")
+        judgment.append("touches .github/workflows — the App has no workflows permission; owner merges")
     if other:
-        hold.append("touches non-dependency files: " + ", ".join(sorted(other)[:5]))
+        broken.append("touches non-dependency files: " + ", ".join(sorted(other)[:5]))
     if not files:
-        hold.append("no changed files reported")
+        broken.append("no changed files reported")
 
-    bodies = [c.get("messageBody", "") for c in pr.get("commits") or []]
-    v.level = semver_level(v.title, bodies)
+    commits = pr.get("commits") or []
+    foreign = sorted({a.get("login") or a.get("email") or "?"
+                      for c in commits for a in c.get("authors") or []
+                      if (a.get("login") or "") not in DEPENDABOT_LOGINS})
+    if foreign:
+        broken.append("branch has non-Dependabot commits by " + ", ".join(foreign[:3]))
+
+    v.level = semver_level(v.title, [c.get("messageBody", "") for c in commits])
     if v.level is None:
-        hold.append("semver level unknown (no Dependabot update-type, no parsable versions)")
+        judgment.append("semver level unknown (no Dependabot update-type, no parsable versions)")
     elif v.level not in policy.semver:
-        hold.append(f"{v.level} bump — policy allows {'/'.join(policy.semver)} only")
+        judgment.append(f"{v.level} bump — policy allows {'/'.join(policy.semver)} only")
 
     if policy.require_checks:
         state, names = check_state(pr.get("statusCheckRollup") or [])
         if state == "none":
-            hold.append("no CI checks — nothing verifies this bump")
+            broken.append("no CI checks — nothing verifies this bump")
         elif state == "fail":
-            hold.append("CI failing: " + ", ".join(names[:5]))
+            broken.append("CI failing: " + ", ".join(names[:5]))
         elif state == "pending":
             wait.append("CI still running: " + ", ".join(names[:5]))
 
     mergeable = (pr.get("mergeable") or "").upper()
-    if mergeable == "CONFLICTING":
-        hold.append("merge conflict — needs `@dependabot rebase` or recreate")
+    merge_state = (pr.get("mergeStateStatus") or "").upper()
+    if mergeable == "CONFLICTING" or merge_state == "DIRTY":
+        broken.append("merge conflict — needs `@dependabot rebase` or recreate")
     elif mergeable != "MERGEABLE":
         wait.append(f"mergeability {mergeable or 'UNKNOWN'} (GitHub still computing)")
+    elif merge_state == "BLOCKED":
+        broken.append("blocked by branch protection (required review or check)")
+    elif merge_state == "BEHIND":
+        broken.append("branch is behind base — comment `@dependabot rebase`")
 
     age_h = v.age_hours = (now - _parse_ts(pr["createdAt"])).total_seconds() / 3600
     if age_h < policy.min_pr_age_hours:
+        cooling = True
         wait.append(f"cooling: {age_h:.0f}h old, needs {policy.min_pr_age_hours}h")
 
+    hold = judgment + broken
     if hold:
         v.action, v.reasons = "hold", hold + wait
+        v.owner_can_merge = not broken and len(wait) == int(cooling)
     elif wait:
         v.action, v.reasons = "wait", wait
     else:

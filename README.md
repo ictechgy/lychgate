@@ -64,7 +64,7 @@ Only `--apply` ever calls a mutating API.
 
 1. Push this repo to GitHub (e.g. `ictechgy/groundskeeper`).
 2. Create a GitHub App with the permissions above and install it on the repos in `registry.yml`.
-3. In the control repo, set variable `GK_APP_ID` and secret `GK_APP_PRIVATE_KEY`.
+3. In the control repo, set variable `GK_APP_CLIENT_ID` and secret `GK_APP_PRIVATE_KEY`.
 4. Let it run in dry-run for a few days and read the Actions summaries.
 5. When the verdicts look right, set variable `GK_APPLY=1`.
 
@@ -74,3 +74,12 @@ which stops GitHub from disabling its cron after 60 idle days.
 
 Requires Python ≥ 3.9 and `gh`. No other dependencies. `yamlio.py` is
 vendored from [riskgate](https://github.com/ictechgy/riskgate) (MIT).
+
+## Threat model (v0.1)
+
+Tier 1 trusts **people with write access to the target repo**. It checks
+file paths, authors, CI and semver, but not diff contents. Someone with
+write access who adds a malicious line to a Dependabot branch is caught
+by the non-Dependabot-commit gate. Someone who changes a manifest through
+some other route is not. That is fine for your own repos. Adopting
+strangers' repos will need a diff-content layer first.

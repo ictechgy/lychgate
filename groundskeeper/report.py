@@ -29,7 +29,7 @@ def waiting_issues(issues: List[Dict[str, Any]], owner: str, days: int,
 
 
 def _acting(r: Dict[str, Any]) -> bool:
-    return "error" not in r and r["policy"].may_merge
+    return "error" not in r and "note" not in r and r["policy"].may_merge
 
 
 def _observed_summary(verdicts: List[Verdict], p: Policy) -> str:
@@ -77,6 +77,9 @@ def render(results: List[Dict[str, Any]], applied: bool,
         if r.get("error"):
             lines += [f"⚠️ {r['error']}", ""]
             continue
+        if r.get("note"):
+            lines += [r["note"], ""]
+            continue
         if not r["verdicts"] and not r["issues"]:
             lines += ["Nothing pending.", ""]
             continue
@@ -89,6 +92,9 @@ def render(results: List[Dict[str, Any]], applied: bool,
             lines.append(f"- {_ICON.get(v.action, '?')} **{label}** [#{v.number}]({v.url}) {v.title}{lvl}")
             for reason in v.reasons:
                 lines.append(f"  - {reason}")
+            if v.owner_can_merge:
+                lines.append(f"  - your call — CI green, mergeable: "
+                             f"`gh pr merge {v.number} -R {v.repo} --squash`")
         for i in r["issues"]:
             lines.append(f"- 💬 unanswered {i['age_days']}d: [#{i['number']}]({i['url']}) "
                          f"{i['title']} — by @{i['author']['login']}")

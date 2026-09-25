@@ -18,6 +18,10 @@ class SemverTest(unittest.TestCase):
     def test_title_can_raise_but_not_lower(self):
         self.assertEqual(semver_level("Bump x from 1.2.3 to 2.0.0", [META_PATCH]), "major")
 
+    def test_every_title_pair_counts(self):
+        t = "Bump a from 1.0.0 to 1.0.1 and b from 1.0.0 to 2.0.0"
+        self.assertEqual(semver_level(t, []), "major")
+
     def test_zero_major_minor_bump_is_breaking(self):
         self.assertEqual(level_from_versions("0.4.1", "0.5.0"), "major")
         self.assertEqual(level_from_versions("0.4.1", "0.4.2"), "patch")
@@ -104,6 +108,39 @@ class EvaluateTest(unittest.TestCase):
 
     def test_unknown_mergeability_waits(self):
         self.assertEqual(self.verdict(mergeable="UNKNOWN").action, "wait")
+
+    def test_truncated_file_list_holds(self):
+        files = [{"path": f"pkg{i}/package.json"} for i in range(100)]
+        self.assertEqual(self.verdict(files=files).action, "hold")
+
+    def test_foreign_commit_on_dependabot_branch_holds(self):
+        commits = [{"messageBody": META_PATCH, "authors": [{"login": "dependabot[bot]"}]},
+                   {"messageBody": "tweak", "authors": [{"login": "mallory"}]}]
+        v = self.verdict(commits=commits)
+        self.assertEqual(v.action, "hold")
+        self.assertIn("mallory", v.reasons[0])
+
+    def test_branch_protection_states(self):
+        self.assertEqual(self.verdict(mergeStateStatus="BLOCKED").action, "hold")
+        self.assertEqual(self.verdict(mergeStateStatus="BEHIND").action, "hold")
+        self.assertEqual(self.verdict(mergeStateStatus="DIRTY").action, "hold")
+        self.assertEqual(self.verdict(mergeStateStatus="UNSTABLE").action, "merge")
+
+    def test_missing_head_sha_holds(self):
+        self.assertEqual(self.verdict(headRefOid="").action, "hold")
+
+    def test_owner_shortcut_only_for_judgment_calls(self):
+        wf = self.verdict(files=[{"path": ".github/workflows/ci.yml"}])
+        self.assertTrue(wf.owner_can_merge)
+        young_major = self.verdict(title="Bump qs from 6.5.2 to 7.0.0",
+                                   createdAt="2026-09-25T00:00:00Z")
+        self.assertTrue(young_major.owner_can_merge)
+        red = [{"__typename": "CheckRun", "name": "t", "status": "COMPLETED",
+                "conclusion": "FAILURE"}]
+        self.assertFalse(self.verdict(files=[{"path": ".github/workflows/ci.yml"}],
+                                      statusCheckRollup=red).owner_can_merge)
+        self.assertFalse(self.verdict(mergeable="UNKNOWN", title="Bump qs from 1.0.0 to 2.0.0")
+                         .owner_can_merge)
 
     def test_hold_beats_wait(self):
         v = self.verdict(mergeable="UNKNOWN", files=[{"path": "src/x.py"}])

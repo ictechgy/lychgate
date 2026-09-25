@@ -115,8 +115,12 @@ class RunTest(unittest.TestCase):
 
     def test_owner_can_revoke_from_their_repo(self):
         gh = FakeGitHub({"me/tool": [pr(1)]}, steward={"me/tool": "steward:\n  enabled: false\n"})
-        run(self.args(apply=True), gh, NOW)
+        self.assertEqual(run(self.args(apply=True), gh, NOW), 0)
         self.assertEqual(gh.merged, [])
+        with open(self.report) as f:
+            text = f.read()
+        self.assertIn("Disabled by the owner", text)
+        self.assertNotIn("error", text)
 
     def test_failed_merge_is_logged_not_fatal(self):
         gh = FakeGitHub({"me/tool": [pr(1)]}, fail_merge=True)

@@ -16,28 +16,37 @@ concurrency:
 
 permissions:
   contents: write   # commit ledger.jsonl + digests/ to this control repo only
-  issues: write     # weekly digest issue in this control repo only
+  issues: write     # digest / failure issues in this control repo only
 
 jobs:
   run:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      # Pinned by SHA: a supply-chain custodian should not float its own deps.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
+      # Tests run before any token exists: broken code never gets credentials.
       - run: python -m unittest discover -s tests -t .
 
-      # App token: contents + pull_requests write, NO administration, NO workflows.
+      # Downscoped installation token. Even if the App were misconfigured with
+      # more, this token cannot administer repos or touch workflows.
       - id: app
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ vars.GK_APP_ID }}
+          client-id: ${{ vars.GK_APP_CLIENT_ID }}
           private-key: ${{ secrets.GK_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: read
+          permission-checks: read
+          permission-statuses: read
+          permission-vulnerability-alerts: read
 
       - name: Evaluate (and merge when applying)
         env:
@@ -59,10 +68,23 @@ jobs:
           git diff --cached --quiet || git commit -m "digest: $(date -u +%F)"
           git push
 
-      - name: Weekly digest issue (Mondays)
+      - name: Weekly digest issue (Mondays, once)
         if: always() && hashFiles('report.md') != ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           [ "$(date -u +%u)" = "1" ] || exit 0
-          gh issue create --title "Digest $(date -u +%G-W%V)" --body-file report.md
+          title="Digest $(date -u +%G-W%V)"
+          if gh issue list --state all --search "\"$title\" in:title" --json number --jq length | grep -qx 0; then
+            gh issue create --title "$title" --body-file report.md
+          fi
+
+      # A custodian that dies silently is the worst failure mode: say so loudly.
+      - name: Report failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh issue create --title "groundskeeper run failed ($(date -u +%F))" \
+            --body "The daily run failed and may not have produced a digest: $RUN_URL"

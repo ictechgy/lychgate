@@ -57,7 +57,7 @@ def run(args: argparse.Namespace, gh: Optional[GitHub] = None,
             policy = resolve(registry, entry, _steward_yml(gh, repo))
             result["policy"] = policy
             if not policy.enabled:
-                result["error"] = "disabled (steward.enabled: false)"
+                result["note"] = "Disabled by the owner (steward.enabled: false)."
                 results.append(result)
                 continue
             result["verdicts"] = plan(gh.dependabot_prs(repo), policy, now)
@@ -78,6 +78,9 @@ def run(args: argparse.Namespace, gh: Optional[GitHub] = None,
             entry_log = {"ts": now.isoformat(), "run": run_id, "repo": repo,
                          "pr": v.number, "sha": v.head_sha, "level": v.level,
                          "title": v.title}
+            # Also printed, so the Actions log backs up the ledger if the
+            # later commit/push step fails.
+            print(json.dumps({**entry_log, "action": "merging"}), file=sys.stderr)
             try:
                 gh.merge(repo, v.number, v.head_sha)
                 _ledger_append(args.ledger, {**entry_log, "action": "merged",
