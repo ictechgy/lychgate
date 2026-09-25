@@ -49,7 +49,7 @@ def render(results: List[Dict[str, Any]], applied: bool,
            now: Optional[datetime] = None) -> str:
     now = now or datetime.now(timezone.utc)
     mode = "apply" if applied else "dry-run"
-    lines = [f"# Groundskeeper digest — {now:%Y-%m-%d} ({mode})", ""]
+    lines = [f"# Lychgate digest — {now:%Y-%m-%d} ({mode})", ""]
     counts: Dict[str, int] = {}
     observed = 0
     for r in results:

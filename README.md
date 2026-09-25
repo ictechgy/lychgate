@@ -1,9 +1,13 @@
-# groundskeeper
+# lychgate
 
 A deterministic custodian for repos you stopped tending.
 
+*A lychgate is the roofed gate at a churchyard entrance, where a coffin
+rests until the priest arrives. Here, PRs that pass fixed rules go
+through the gate, and everything else waits there for its owner.*
+
 Dependabot keeps opening PRs on repos you no longer visit; nobody merges
-them. Groundskeeper runs from one always-active **control repo**, looks at
+them. Lychgate runs from one always-active **control repo**, looks at
 every repo you register, merges the Dependabot PRs that are provably
 boring, and writes a digest of everything that needs you.
 
@@ -53,8 +57,8 @@ The owner can always revoke from inside the repo with `steward.enabled: false`.
 ## Run locally (dry-run)
 
 ```bash
-python3 -m groundskeeper run            # uses your `gh` login, read-only
-python3 -m groundskeeper run --only ictechgy/kartograph
+python3 -m lychgate run            # uses your `gh` login, read-only
+python3 -m lychgate run --only ictechgy/kartograph
 python3 -m unittest discover -s tests -t .
 ```
 
@@ -62,7 +66,7 @@ Only `--apply` ever calls a mutating API.
 
 ## Set up the control repo
 
-1. Push this repo to GitHub (e.g. `ictechgy/groundskeeper`).
+1. Push this repo to GitHub (e.g. `ictechgy/lychgate`).
 2. Create a GitHub App with the permissions above and install it on the repos in `registry.yml`.
 3. In the control repo, set variable `GK_APP_CLIENT_ID` and secret `GK_APP_PRIVATE_KEY`.
 4. Let it run in dry-run for a few days and read the Actions summaries.

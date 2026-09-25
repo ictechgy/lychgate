@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from groundskeeper.config import resolve
+from lychgate.config import resolve
 
 NOW = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
 

@@ -1,6 +1,6 @@
 import unittest
 
-from groundskeeper.decide import (
+from lychgate.decide import (
     check_state, evaluate, is_dependency_file, level_from_versions, plan, semver_level,
 )
 

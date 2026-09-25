@@ -4,9 +4,9 @@ import os
 import tempfile
 import unittest
 
-from groundskeeper.cli import run
-from groundskeeper.config import ConfigError, load_registry, resolve
-from groundskeeper.github import GitHubError
+from lychgate.cli import run
+from lychgate.config import ConfigError, load_registry, resolve
+from lychgate.github import GitHubError
 
 from .fixtures import NOW, pr
 

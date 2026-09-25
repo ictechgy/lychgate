@@ -1,4 +1,4 @@
-"""groundskeeper run [--apply] — evaluate every registered repo, optionally
+"""lychgate run [--apply] — evaluate every registered repo, optionally
 merge what passed, append to the ledger, write the digest.
 
 Dry-run is the default. Only `--apply` ever calls a mutating API, and the
@@ -101,7 +101,7 @@ def run(args: argparse.Namespace, gh: Optional[GitHub] = None,
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    ap = argparse.ArgumentParser(prog="groundskeeper",
+    ap = argparse.ArgumentParser(prog="lychgate",
                                  description="Deterministic custodian for repos you stopped tending.")
     ap.add_argument("--version", action="version", version=__version__)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -115,5 +115,5 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         return run(args)
     except (ConfigError, OSError) as e:
-        print(f"groundskeeper: {e}", file=sys.stderr)
+        print(f"lychgate: {e}", file=sys.stderr)
         return 2

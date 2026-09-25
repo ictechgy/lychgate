@@ -1,4 +1,4 @@
-name: groundskeeper
+name: lychgate
 
 on:
   schedule:
@@ -11,7 +11,7 @@ on:
         default: false
 
 concurrency:
-  group: groundskeeper
+  group: lychgate
   cancel-in-progress: false
 
 permissions:
@@ -55,15 +55,15 @@ jobs:
         run: |
           flag=""
           if [ "$APPLY" = "true" ]; then flag="--apply"; fi
-          python -m groundskeeper run $flag --report report.md
+          python -m lychgate run $flag --report report.md
           cat report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Commit digest + ledger
         if: always() && hashFiles('report.md') != ''
         run: |
           cp report.md "digests/$(date -u +%G-W%V).md"
-          git config user.name "groundskeeper[bot]"
-          git config user.email "groundskeeper@users.noreply.github.com"
+          git config user.name "lychgate[bot]"
+          git config user.email "lychgate@users.noreply.github.com"
           git add ledger.jsonl digests/
           git diff --cached --quiet || git commit -m "digest: $(date -u +%F)"
           git push
@@ -86,5 +86,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh issue create --title "groundskeeper run failed ($(date -u +%F))" \
+          gh issue create --title "lychgate run failed ($(date -u +%F))" \
             --body "The daily run failed and may not have produced a digest: $RUN_URL"
