@@ -41,7 +41,8 @@ class FakeGitHub:
         return self.alerts.get(repo, {"state": "count", "total": 0, "crit_high": 0, "no_patch": 0})
 
     def base_checks(self, repo, ref):
-        return self.base.get(repo, {})
+        self.base_refs_asked = getattr(self, "base_refs_asked", []) + [ref]
+        return self.base.get(repo, {}).get(ref, {})
 
     def dependabot_prs(self, repo):
         return self.prs.get(repo, [])
@@ -185,7 +186,7 @@ class RunTest(unittest.TestCase):
         red = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
                 "conclusion": "FAILURE"}]
         gh = FakeGitHub({"me/tool": [pr(1, statusCheckRollup=red, baseRefName="main")]},
-                        base={"me/tool": {"test": {"state": "fail", "at": "2026-09-24T00:00:00Z"}}})
+                        base={"me/tool": {"main": {("", "test"): {"state": "fail", "at": "2026-09-24T00:00:00Z"}}}})
         run(self.args(), gh, NOW)
         self.assertIn("why red: **base-broken**", self.read_report())
 
@@ -195,11 +196,55 @@ class RunTest(unittest.TestCase):
         prs = [pr(n, statusCheckRollup=red, baseRefName="main",
                   createdAt=f"2026-09-1{n}T00:00:00Z") for n in (1, 2)]
         gh = FakeGitHub({"me/tool": prs},
-                        base={"me/tool": {"test": {"state": "fail", "at": "2026-09-24T00:00:00Z"}}})
+                        base={"me/tool": {"main": {("", "test"): {"state": "fail", "at": "2026-09-24T00:00:00Z"}}}})
         run(self.args(), gh, NOW)
         text = self.read_report()
         self.assertEqual(text.count("fail on `main` too"), 1)
         self.assertIn("why red: **base-broken** — same as #1", text)
+
+    def test_a_broken_dependabot_yml_cannot_sink_the_run(self):
+        gh = FakeGitHub({}, files={"me/tool": {".github/dependabot.yml": "version: 2\nupdates: 1\n"}})
+        self.assertEqual(run(self.args(), gh, NOW), 0)
+        self.assertIn("unrecognised shape", self.read_report())
+
+    def test_any_advisor_crash_becomes_a_digest_line(self):
+        from unittest import mock
+        red = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                "conclusion": "FAILURE"}]
+        gh = FakeGitHub({"me/tool": [pr(1, statusCheckRollup=red, baseRefName="main")]})
+        with mock.patch("lychgate.advise.classify_red", side_effect=KeyError("boom")):
+            self.assertEqual(run(self.args(), gh, NOW), 0)
+        self.assertIn("advisor failed (KeyError)", self.read_report())
+
+    def test_a_failed_file_probe_is_attributed_to_that_file(self):
+        yml = "version: 2\nupdates:\n  - package-ecosystem: gradle\n    directory: /\n"
+
+        class Flaky(FakeGitHub):
+            def file(self, repo, path):
+                if path == "gradle/verification-metadata.xml":
+                    raise GitHubError("HTTP 502")
+                return super().file(repo, path)
+
+        gh = Flaky({}, files={"me/tool": {".github/dependabot.yml": yml}})
+        run(self.args(), gh, NOW)
+        text = self.read_report()
+        self.assertIn("could not check `gradle/verification-metadata.xml`", text)
+        self.assertNotIn("could not read `.github/dependabot.yml`", text)
+
+    def test_base_checks_are_fetched_per_target_branch(self):
+        red = [{"__typename": "CheckRun", "name": "test", "status": "COMPLETED",
+                "conclusion": "FAILURE"}]
+        gh = FakeGitHub({"me/tool": [pr(1, statusCheckRollup=red, baseRefName="main"),
+                                     pr(2, statusCheckRollup=red, baseRefName="develop",
+                                        createdAt="2026-09-19T00:00:00Z")]})
+        run(self.args(), gh, NOW)
+        self.assertEqual(sorted(gh.base_refs_asked), ["develop", "main"])
+
+    def test_warning_does_not_swallow_the_status_line(self):
+        gh = FakeGitHub({}, alerts={"me/tool": {"state": "disabled"}})
+        run(self.args(), gh, NOW)
+        text = self.read_report()
+        self.assertIn("(lychgate cannot: that needs administration)\n\nNothing pending", text)
 
     def test_failed_merge_is_logged_not_fatal(self):
         gh = FakeGitHub({"me/tool": [pr(1)]}, fail_merge=True)

@@ -95,6 +95,8 @@ def render(results: List[Dict[str, Any]], applied: bool,
         for w in r.get("warnings", []):
             lines.append(f"- ⚠️ {w}")
         if not r["verdicts"] and not r["issues"] and not r.get("advice"):
+            if r.get("warnings"):
+                lines.append("")  # else markdown folds the next line into the last bullet
             if p.status == "complete":
                 # Nothing pending is not the same as verified: no smoke check
                 # has installed or run this repo yet.

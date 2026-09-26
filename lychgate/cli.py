@@ -35,21 +35,35 @@ def _first_file(gh: GitHub, repo: str, paths: tuple) -> Optional[str]:
 
 
 def _advise(gh: GitHub, repo: str, verdicts: list, now: datetime) -> List[str]:
-    """Advice for repos lychgate acts on. Failures here never block a run."""
-    red = [v for v in verdicts if v.failing_checks]
-    if red:
-        ref = next((v.base_ref for v in red if v.base_ref), None)
+    """Advice for repos lychgate acts on. Advice is never a merge input, so
+    nothing that goes wrong here may stop the run or hide the digest."""
+    notes: List[str] = []
+
+    def has_file(path: str) -> bool:
         try:
-            base = gh.base_checks(repo, ref) if ref else None
-        except GitHubError:
-            base = None
-        advise.classify_red(verdicts, base, now)
+            return gh.file(repo, path) is not None
+        except GitHubError as e:
+            notes.append(f"could not check `{path}`: {e}")
+            return False
+
     try:
-        text = _first_file(gh, repo, DEPENDABOT_PATHS)
-        return advise.lint_dependabot(text, verdicts,
-                                      lambda path: gh.file(repo, path) is not None)
-    except GitHubError as e:
-        return [f"could not read `.github/dependabot.yml`: {e}"]
+        try:
+            updates, problem = advise.parse_dependabot(_first_file(gh, repo, DEPENDABOT_PATHS))
+        except GitHubError as e:
+            updates, problem = [], f"could not read `.github/dependabot.yml`: {e}"
+        structural = advise.structural_causes(updates, has_file)
+        red = [v for v in verdicts if v.failing_checks]
+        if red:
+            bases = {}
+            for ref in {v.base_ref for v in red if v.base_ref}:
+                try:
+                    bases[ref] = gh.base_checks(repo, ref)
+                except GitHubError:
+                    bases[ref] = None
+            advise.classify_red(verdicts, bases, now, structural)
+        return advise.lint_dependabot(updates, problem, verdicts, structural) + notes
+    except Exception as e:  # noqa: BLE001 — see docstring
+        return notes + [f"advisor failed ({type(e).__name__}) — advice skipped this run"]
 
 
 def _ledger_append(path: str, entry: Dict[str, Any]) -> None:

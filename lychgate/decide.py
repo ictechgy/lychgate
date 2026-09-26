@@ -76,7 +76,9 @@ class Verdict:
     dep: Optional[str] = None
     target: Optional[str] = None
     base_ref: Optional[str] = None
-    failing_checks: List[str] = field(default_factory=list)
+    # (workflow, check name) keys; workflow is "" for commit statuses
+    failing_checks: List[Tuple[str, str]] = field(default_factory=list)
+    passing_checks: List[Tuple[str, str]] = field(default_factory=list)
     red_causes: List[Tuple[str, str]] = field(default_factory=list)
 
 
@@ -158,6 +160,31 @@ def check_state(rollup: List[Dict[str, Any]]) -> Tuple[str, List[str]]:
     return "pass", []
 
 
+def check_key(c: Dict[str, Any]) -> Tuple[str, str]:
+    """(workflow, name): the same job name in two workflows is two checks."""
+    if c.get("__typename") == "StatusContext":
+        return ("", c.get("context") or "?")
+    return (c.get("workflowName") or "", c.get("name") or "?")
+
+
+def _check_outcomes(rollup: List[Dict[str, Any]]) -> Tuple[List[Tuple[str, str]], List[Tuple[str, str]]]:
+    failing, passing = [], []
+    for c in rollup:
+        if c.get("__typename") == "StatusContext":
+            state = (c.get("state") or "").upper()
+            ok, bad = state == "SUCCESS", state not in _PENDING_STATES and state != "SUCCESS"
+        else:
+            done = (c.get("status") or "").upper() == "COMPLETED"
+            conclusion = (c.get("conclusion") or "").upper()
+            ok = done and conclusion == "SUCCESS"
+            bad = done and conclusion not in _OK_CONCLUSIONS
+        if ok:
+            passing.append(check_key(c))
+        elif bad:
+            failing.append(check_key(c))
+    return failing, passing
+
+
 def ecosystem_of(head_ref: str) -> Optional[str]:
     """Dependabot branches are dependabot/<ecosystem>/...; None otherwise."""
     parts = (head_ref or "").split("/")
@@ -233,6 +260,7 @@ def evaluate(pr: Dict[str, Any], policy: Policy, now: datetime) -> Verdict:
     elif v.level not in policy.semver:
         judgment.append(f"{v.level} bump — policy allows {'/'.join(policy.semver)} only")
 
+    v.failing_checks, v.passing_checks = _check_outcomes(pr.get("statusCheckRollup") or [])
     if policy.require_checks:
         state, names = check_state(pr.get("statusCheckRollup") or [])
         if state == "none":
@@ -240,7 +268,6 @@ def evaluate(pr: Dict[str, Any], policy: Policy, now: datetime) -> Verdict:
         elif state == "noop":
             broken.append("no check actually ran (all skipped/neutral) — nothing verifies this bump")
         elif state == "fail":
-            v.failing_checks = names
             broken.append("CI failing: " + ", ".join(names[:5]))
         elif state == "pending":
             wait.append("CI still running: " + ", ".join(names[:5]))
@@ -257,7 +284,11 @@ def evaluate(pr: Dict[str, Any], policy: Policy, now: datetime) -> Verdict:
         broken.append("branch is behind base — comment `@dependabot rebase`")
 
     # Cooling runs from the newest content, not PR creation: Dependabot
-    # rewrites PRs in place when a newer version ships.
+    # rewrites PRs in place when a newer version ships. Known cost: a
+    # same-version rebase also restarts the clock (fail-closed: it delays,
+    # never merges early). Telling the two apart needs the force-push
+    # timeline's before/after commit metadata — not worth it until a
+    # registered repo actually stalls on it.
     created = _parse_ts(pr["createdAt"])
     v.age_hours = (now - created).total_seconds() / 3600
     head_times = [_parse_ts(c["committedDate"]) for c in commits if c.get("committedDate")]

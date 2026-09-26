@@ -1,9 +1,9 @@
 """Explain held PRs and the Dependabot setup behind them — advice only.
 
 Nothing here feeds a merge decision. Every label comes from fixed rules over
-GitHub metadata (check names and results on the PR and on its base branch,
-PR titles and branches, dependabot.yml). No workflow logs are read, so no
-log text from any repo can reach the public digest, and every suggested
+GitHub metadata (check results on the PR and on its base branch's head, PR
+titles and branches, dependabot.yml, file existence). No workflow logs are
+read, so no log text can reach the public digest, and every suggested
 command is a fixed template.
 """
 
@@ -17,40 +17,141 @@ from . import yamlio
 from .decide import Verdict
 
 STALE_DAYS = 30
-_GROUP_RE_PREFIX = "bump the "
+Key = Tuple[str, str]  # (workflow, check name)
+Base = Optional[Dict[Key, Dict[str, str]]]
 
 
-def _ts(s: str) -> Optional[datetime]:
+def _ts(s: Optional[str]) -> Optional[datetime]:
     try:
-        return datetime.fromisoformat(s.replace("Z", "+00:00"))
-    except (AttributeError, ValueError):
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00"))
+    except ValueError:
         return None
 
 
-def _names(names: List[str], limit: int = 3) -> str:
-    shown = ", ".join(f"`{n}`" for n in names[:limit])
-    return shown + (f" (+{len(names) - limit})" if len(names) > limit else "")
+def _code(text: str) -> str:
+    # Names come from repo config; keep a stray backtick from breaking markup.
+    return "`" + text.replace("`", "'") + "`"
+
+
+def _names(keys: List[Key], limit: int = 3) -> str:
+    shown = ", ".join(_code(name) for _, name in keys[:limit])
+    return shown + (f" (+{len(keys) - limit})" if len(keys) > limit else "")
 
 
 def _prs(vs: List[Verdict]) -> str:
-    return ", ".join(f"#{v.number}" for v in sorted(vs, key=lambda v: v.number))
+    return ", ".join(f"#{n}" for n in sorted({v.number for v in vs}))
 
 
-def classify_red(verdicts: List[Verdict], base: Optional[Dict[str, Dict[str, str]]],
-                 now: datetime) -> None:
+# -- dependabot.yml ---------------------------------------------------------
+
+def parse_dependabot(text: Optional[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """(update entries, problem). A problem string means: say so, lint nothing."""
+    if text is None:
+        return [], ("no `.github/dependabot.yml` — Dependabot opens no version-update PRs "
+                    "here, so lychgate has nothing to act on")
+    try:
+        cfg = yamlio.parse(text)
+    except yamlio.YAMLError as e:
+        return [], f"`.github/dependabot.yml` uses YAML lychgate cannot parse ({e}) — lint skipped"
+    raw = cfg.get("updates") if isinstance(cfg, dict) else None
+    if not isinstance(raw, list):
+        return [], "`.github/dependabot.yml` has an unrecognised shape (`updates` is not a list) — lint skipped"
+    return [u for u in raw if isinstance(u, dict)], None
+
+
+def _groups(entry: Dict[str, Any]) -> Dict[str, Any]:
+    g = entry.get("groups")
+    return g if isinstance(g, dict) else {}
+
+
+def structural_causes(updates: List[Dict[str, Any]],
+                      has_file: Callable[[str], bool]) -> Dict[str, Tuple[str, str]]:
+    """Repo-level facts that make every PR of an ecosystem fail: {eco: (label, why)}."""
+    causes: Dict[str, Tuple[str, str]] = {}
+    if any(u.get("package-ecosystem") == "gradle" for u in updates) \
+            and has_file("gradle/verification-metadata.xml"):
+        causes["gradle"] = (
+            "gradle-verification",
+            "this repo verifies gradle dependencies (`gradle/verification-metadata.xml`) and "
+            "Dependabot does not update that file, so gradle bumps that change dependencies fail "
+            "CI here — regenerate it on the PR branch: "
+            "`./gradlew --write-verification-metadata sha256 help`")
+    return causes
+
+
+def _group_of(title: str) -> Optional[str]:
+    low = (title or "").lower()
+    i = low.find("bump the ")
+    if i < 0 or " group" not in low[i:]:
+        return None
+    return title[i + len("bump the "):].split(" group", 1)[0].strip() or None
+
+
+def lint_dependabot(updates: List[Dict[str, Any]], problem: Optional[str],
+                    verdicts: List[Verdict], structural: Dict[str, Tuple[str, str]]) -> List[str]:
+    """Evidence-backed suggestions for .github/dependabot.yml (read-only).
+
+    Only rules that the repo's open PRs or files actually trigger fire, so a
+    healthy repo gets no advice.
+    """
+    if problem:
+        return [problem]
+    advice: List[str] = []
+
+    actions_prs = [v for v in verdicts if v.ecosystem == "github-actions" and not _group_of(v.title)]
+    actions_entries = [u for u in updates if u.get("package-ecosystem") == "github-actions"]
+    if actions_entries and len(actions_prs) >= 2 and not any(_groups(u) for u in actions_entries):
+        advice.append(f"github-actions updates arrive one PR per action ({_prs(actions_prs)}) — "
+                      f"group them under the github-actions entry: "
+                      f"`groups: {{actions: {{patterns: [\"*\"]}}}}`")
+
+    if "gradle" in structural:
+        open_gradle = [v for v in verdicts if v.ecosystem == "gradle"]
+        if open_gradle:  # the PR lines already carry the full explanation
+            advice.append(f"gradle bumps need you here until `gradle/verification-metadata.xml` "
+                          f"is regenerated on each PR ({_prs(open_gradle)}) — or accept them as "
+                          f"always-manual")
+        else:
+            advice.append(structural["gradle"][1] + ", or accept gradle bumps as always-manual")
+
+    for v in verdicts:
+        group = _group_of(v.title)
+        if not group or v.level != "major":
+            continue
+        for u in updates:
+            spec = _groups(u).get(group)
+            if isinstance(spec, dict) and not spec.get("update-types"):
+                advice.append(f"group {_code(group)} mixes major with minor/patch "
+                              f"([#{v.number}]({v.url}) is major) — add "
+                              f"`update-types: [minor, patch]` to it so safe updates arrive "
+                              f"separately from majors")
+                break
+    return advice
+
+
+# -- why is CI red? ---------------------------------------------------------
+
+def classify_red(verdicts: List[Verdict], bases: Dict[Optional[str], Base], now: datetime,
+                 structural: Optional[Dict[str, Tuple[str, str]]] = None) -> None:
     """Attach (label, explanation) causes to every PR whose CI is failing.
 
-    Labels, in order, and all that apply:
-      base-broken          the same check fails on the base branch too
+    Each PR is judged against its own base branch (`bases[v.base_ref]`).
+    Labels, in order, all that apply:
+      base-broken          the same check fails on the base head too
       sibling-split        parts of one upstream bumped to one version in
                            separate PRs, all red (e.g. codeql init/analyze)
-      repo-rejects-<eco>   the same check fails on 2+ independent <eco> PRs
-                           (a split sibling group counts once) but passes on
-                           base: the repo's own CI refuses this kind of bump
-      base-stale           those checks have not passed on base for 30+ days
-                           (or never ran there), so "base is green" is old news
-      bump-failure         none of the above: probably this bump itself
+      <structural>         a repo fact that fails every PR of this ecosystem
+      repo-rejects-<eco>   the check fails on every <eco> PR that ran it (2+
+                           independent ones) yet passed on base in the last
+                           30 days: the repo's own CI refuses this kind of bump
+      bump-failure         a failing check passed on base recently and nothing
+                           above covers it: probably this bump itself
+      base-stale           the check's last pass on base is 30+ days old
+      no-base-signal       the check does not run on the base head (PR-only
+                           or skipped): nothing to compare against
+      unclassified         base result pending / unavailable
     """
+    structural = structural or {}
     red = [v for v in verdicts if v.failing_checks]
     if not red:
         return
@@ -58,145 +159,112 @@ def classify_red(verdicts: List[Verdict], base: Optional[Dict[str, Dict[str, str
     siblings: Dict[Tuple[Any, ...], List[Verdict]] = defaultdict(list)
     for v in red:
         if v.dep and v.target and v.dep.count("/") >= 2:
-            siblings[(v.ecosystem, v.dep.rsplit("/", 1)[0], v.target)].append(v)
+            siblings[(v.base_ref, v.ecosystem, v.dep.rsplit("/", 1)[0], v.target)].append(v)
     sibling_of = {v.number: (key, vs) for key, vs in siblings.items() if len(vs) >= 2
                   for v in vs}
 
-    failing_by_job: Dict[Tuple[Optional[str], str], List[Verdict]] = defaultdict(list)
-    for v in red:
-        for name in v.failing_checks:
-            failing_by_job[(v.ecosystem, name)].append(v)
+    failed_on: Dict[Tuple[Any, ...], List[Verdict]] = defaultdict(list)
+    passed_on: Dict[Tuple[Any, ...], List[Verdict]] = defaultdict(list)
+    for v in verdicts:
+        for k in v.failing_checks:
+            failed_on[(v.base_ref, v.ecosystem, k)].append(v)
+        for k in v.passing_checks:
+            passed_on[(v.base_ref, v.ecosystem, k)].append(v)
 
-    def independent_failures(eco: Optional[str], name: str) -> int:
+    def independent_failures(scope: Tuple[Any, ...]) -> int:
         # A split sibling group counts once: its members fail together
         # because of the split, not because the repo rejects the bump.
-        units = {sibling_of[p.number][0] if p.number in sibling_of else p.number
-                 for p in failing_by_job[(eco, name)]}
-        return len(units)
-
-    base_ref = next((v.base_ref for v in red if v.base_ref), "the base branch")
-
-    def base_state(name: str) -> Optional[str]:
-        return (base or {}).get(name, {}).get("state")
+        return len({sibling_of[p.number][0] if p.number in sibling_of else p.number
+                    for p in failed_on[scope]})
 
     for v in red:
+        ref = v.base_ref or "the base branch"
+        base = bases.get(v.base_ref) if v.base_ref else None
         causes: List[Tuple[str, str]] = []
-        if base is not None:
-            broken = [n for n in v.failing_checks if base_state(n) == "fail"]
+        covered: set = set()
+
+        def state(k: Key) -> Optional[str]:
+            return (base or {}).get(k, {}).get("state")
+
+        def age_days(k: Key) -> Optional[int]:
+            at = _ts((base or {}).get(k, {}).get("at"))
+            return (now - at).days if at else None
+
+        def fresh_pass(k: Key) -> bool:
+            d = age_days(k)
+            return state(k) == "pass" and d is not None and d < STALE_DAYS
+
+        if base:
+            broken = [k for k in v.failing_checks if state(k) == "fail"]
             if broken:
+                covered.update(broken)
                 causes.append(("base-broken",
-                               f"{_names(broken)} fail on `{base_ref}` too — fix `{base_ref}` first: "
-                               f"`gh run list -R {v.repo} --branch {base_ref} --limit 5`"))
+                               f"{_names(broken)} fail on `{ref}` too — fix `{ref}` first: "
+                               f"`gh run list -R {v.repo} --branch {ref} --limit 5`"))
 
         if v.number in sibling_of:
-            (eco, prefix, target), vs = sibling_of[v.number]
-            group = prefix.rsplit("/", 1)[-1]
+            (_, eco, prefix, target), vs = sibling_of[v.number]
+            # The split explains checks that fail only inside the group; a
+            # check that also fails elsewhere still needs its own label.
+            group = {p.number for p in vs}
+            covered.update(k for k in v.failing_checks
+                           if {p.number for p in failed_on[(v.base_ref, v.ecosystem, k)]} <= group)
             causes.append(("sibling-split",
-                           f"`{prefix}` parts bumped to {target} in separate PRs ({_prs(vs)}) — "
-                           f"each is red until the others land. Group them in `.github/dependabot.yml` "
-                           f"under the {eco or 'same'} entry: "
-                           f"`groups: {{{group}: {{patterns: [\"{prefix}*\"]}}}}`"))
+                           f"{_code(prefix)} parts bumped to {target} in separate PRs ({_prs(vs)}) — "
+                           f"each is red until the others land. Group them in "
+                           f"`.github/dependabot.yml` under the {eco or 'same'} entry: "
+                           f"`groups: {{{prefix.rsplit('/', 1)[-1]}: {{patterns: [\"{prefix}*\"]}}}}`"))
 
-        if base is not None and v.ecosystem:
-            rejects = [n for n in v.failing_checks if base_state(n) == "pass"
-                       and independent_failures(v.ecosystem, n) >= 2]
+        if v.ecosystem in structural:
+            covered.update(v.failing_checks)
+            causes.append(structural[v.ecosystem])
+
+        if base and v.ecosystem:
+            rejects = [k for k in v.failing_checks if k not in covered and fresh_pass(k)
+                       and independent_failures((v.base_ref, v.ecosystem, k)) >= 2
+                       and not passed_on[(v.base_ref, v.ecosystem, k)]]
             if rejects:
-                others = {p.number: p for n in rejects for p in failing_by_job[(v.ecosystem, n)]}
+                covered.update(rejects)
+                who = {p.number: p for k in rejects for p in failed_on[(v.base_ref, v.ecosystem, k)]}
                 causes.append((f"repo-rejects-{v.ecosystem}",
-                               f"{_names(rejects)} fail on every {v.ecosystem} PR "
-                               f"({_prs(list(others.values()))}) but pass on `{base_ref}` — the repo's "
-                               f"own CI refuses these bumps. Fix it once in the repo, or stop the "
-                               f"stream (`ignore` it in `.github/dependabot.yml`)"))
+                               f"{_names(rejects)} fail on all {len(who)} {v.ecosystem} PRs that "
+                               f"ran them ({_prs(list(who.values()))}) but passed on `{ref}` "
+                               f"recently — the repo's own CI refuses these bumps. Fix it once in "
+                               f"the repo, or stop the stream (`ignore` it in "
+                               f"`.github/dependabot.yml`)"))
 
-        if base is not None:
-            stale, never = [], []
-            for n in v.failing_checks:
-                info = (base or {}).get(n)
-                if not info or info["state"] == "skipped":
-                    never.append(n)
-                elif info["state"] == "pass":
-                    at = _ts(info["at"])
-                    if at and (now - at).days >= STALE_DAYS:
-                        stale.append((n, (now - at).days))
-            if stale or never:
-                bits = []
-                if stale:
-                    oldest = max(d for _, d in stale)
-                    bits.append(f"{_names([n for n, _ in stale])} last passed on `{base_ref}` "
-                                f"{oldest}d ago")
-                if never:
-                    bits.append(f"{_names(never)} never ran on `{base_ref}`'s head")
+        if base:
+            genuine = [k for k in v.failing_checks if k not in covered and fresh_pass(k)]
+            if genuine:
+                causes.append(("bump-failure",
+                               f"{_names(genuine)} passed on `{ref}` recently and no known "
+                               f"structural cause applies — likely this bump itself; see the PR's checks"))
+
+            stale = [(k, age_days(k)) for k in v.failing_checks
+                     if k not in covered and state(k) == "pass" and not fresh_pass(k)]
+            if stale:
+                ages = [d for _, d in stale if d is not None]
+                when = f"{max(ages)}d ago" if ages else "at an unknown time"
                 causes.append(("base-stale",
-                               "; ".join(bits) + f" — re-run CI on `{base_ref}` before blaming "
-                               f"the bump: `gh run list -R {v.repo} --branch {base_ref} --limit 5`"))
+                               f"{_names([k for k, _ in stale])} last passed on `{ref}` {when} — "
+                               f"re-run CI on `{ref}` before blaming the bump: "
+                               f"`gh run list -R {v.repo} --branch {ref} --limit 5`"))
 
-        if not causes:
-            if base is None:
-                causes.append(("unclassified", "base-branch checks unavailable this run"))
-            else:
-                causes.append(("bump-failure", "checks pass on the base branch and nothing "
-                               "structural explains it — likely this bump itself; see the PR's checks"))
+            unseen = [k for k in v.failing_checks if k not in covered and state(k) in (None, "skipped")]
+            if unseen:
+                causes.append(("no-base-signal",
+                               f"{_names(unseen)} did not run on `{ref}`'s head (PR-only or "
+                               f"skipped), so there is no base result to compare against"))
+
+            pending = [k for k in v.failing_checks if k not in covered and state(k) == "pending"]
+            if pending:
+                causes.append(("unclassified",
+                               f"{_names(pending)} still running on `{ref}` — re-check once they finish"))
+        elif base == {}:
+            if not causes:
+                causes.append(("unclassified",
+                               f"no check results on `{ref}`'s head (CI may run on pull requests "
+                               f"only), so red CI cannot be compared with the base"))
+        elif not causes:
+            causes.append(("unclassified", f"`{ref}` checks unavailable this run"))
         v.red_causes = causes
-
-
-def _group_of(title: str) -> Optional[str]:
-    low = (title or "").lower()
-    i = low.find(_GROUP_RE_PREFIX)
-    if i < 0 or " group" not in low[i:]:
-        return None
-    rest = title[i + len(_GROUP_RE_PREFIX):]
-    return rest.split(" group", 1)[0].strip() or None
-
-
-def lint_dependabot(text: Optional[str], verdicts: List[Verdict],
-                    has_file: Callable[[str], bool]) -> List[str]:
-    """Evidence-backed suggestions for .github/dependabot.yml (read-only).
-
-    Only rules that the repo's open PRs or files actually trigger fire, so a
-    healthy repo gets no advice.
-    """
-    if text is None:
-        return ["no `.github/dependabot.yml` — Dependabot opens no version-update PRs here, "
-                "so lychgate has nothing to act on"]
-    try:
-        cfg = yamlio.parse(text) or {}
-    except yamlio.YAMLError as e:
-        return [f"`.github/dependabot.yml` uses YAML lychgate cannot parse ({e}) — lint skipped"]
-    updates = [u for u in (cfg.get("updates") or []) if isinstance(u, dict)] \
-        if isinstance(cfg, dict) else []
-    by_eco = defaultdict(list)
-    for u in updates:
-        by_eco[str(u.get("package-ecosystem", ""))].append(u)
-
-    advice: List[str] = []
-    open_by_eco = defaultdict(list)
-    for v in verdicts:
-        open_by_eco[v.ecosystem].append(v)
-
-    actions_prs = [v for v in open_by_eco.get("github-actions", []) if not _group_of(v.title)]
-    ungrouped = [u for u in by_eco.get("github-actions", []) if not u.get("groups")]
-    if ungrouped and len(actions_prs) >= 2:
-        advice.append(f"github-actions updates arrive one PR per action ({_prs(actions_prs)}) — "
-                      f"group them under the github-actions entry: "
-                      f"`groups: {{actions: {{patterns: [\"*\"]}}}}`")
-
-    if by_eco.get("gradle") and has_file("gradle/verification-metadata.xml"):
-        advice.append("gradle dependency verification is on and Dependabot does not update "
-                      "`gradle/verification-metadata.xml`, so every gradle bump fails CI here "
-                      "and needs you: regenerate with "
-                      "`./gradlew --write-verification-metadata sha256 help` on the PR branch, "
-                      "or accept gradle bumps as always-manual")
-
-    for v in verdicts:
-        group = _group_of(v.title)
-        if not group or v.level != "major":
-            continue
-        for u in updates:
-            spec = (u.get("groups") or {}).get(group)
-            if isinstance(spec, dict) and not spec.get("update-types"):
-                advice.append(f"group `{group}` mixes major with minor/patch "
-                              f"([#{v.number}]({v.url}) is major) — add "
-                              f"`update-types: [minor, patch]` to it so safe updates arrive "
-                              f"separately from majors")
-                break
-    return advice

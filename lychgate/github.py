@@ -7,7 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import subprocess
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 PR_FIELDS = ",".join((
     "number", "title", "url", "author", "createdAt", "isDraft", "mergeable",
@@ -19,6 +19,15 @@ PR_FIELDS = ",".join((
 # tells us whether older PRs were cut off.
 PR_PAGE = 30
 ISSUE_FIELDS = "number,title,url,author,createdAt,comments,labels"
+# The base commit's own status rollup: latest result per check, with the
+# workflow name so a `test` job in two workflows stays two checks.
+_BASE_QUERY = (
+    "query($o:String!,$n:String!,$r:String!){repository(owner:$o,name:$n){"
+    "object(expression:$r){... on Commit{statusCheckRollup{contexts(first:100){nodes{"
+    "__typename ... on CheckRun{name status conclusion completedAt startedAt "
+    "checkSuite{workflowRun{workflow{name}}}} "
+    "... on StatusContext{context state createdAt}}}}}}}}"
+)
 
 
 class GitHubError(RuntimeError):
@@ -65,8 +74,8 @@ class GitHub:
         try:
             out = self._gh("api", "--paginate",
                            f"repos/{repo}/dependabot/alerts?state=open&per_page=100",
-                           "--jq", '.[] | "\(.security_advisory.severity)\t'
-                                   '\(.security_vulnerability.first_patched_version != null)"')
+                           "--jq", r'.[] | "\(.security_advisory.severity)\t'
+                                   r'\(.security_vulnerability.first_patched_version != null)"')
         except GitHubError as e:
             if "disabled" in str(e).lower():
                 return {"state": "disabled"}
@@ -75,48 +84,67 @@ class GitHub:
         return {
             "state": "count",
             "total": len(rows),
-            "crit_high": sum(1 for sev, _ in rows if sev in ("critical", "high")),
-            "no_patch": sum(1 for _, patched in rows if patched != "true"),
+            "crit_high": sum(1 for r in rows if r[0] in ("critical", "high")),
+            "no_patch": sum(1 for r in rows if r[-1] != "true"),
         }
 
     def _alerts_enablement(self, repo: str) -> str:
-        # The alerts API's refusal wording varies by token type; this endpoint
-        # answers 204 (enabled) / 404 (disabled) when the token may ask at all.
+        # The alerts API's refusal wording varies by token type. This endpoint
+        # answers 204 (enabled) / 404 (disabled) — but it also says 404 to any
+        # caller without admin, so a 404 only means "disabled" for an admin.
         try:
             self._gh("api", f"repos/{repo}/vulnerability-alerts")
+            return "unknown"  # enabled, but this token cannot read the alerts
         except GitHubError as e:
-            return "disabled" if ("404" in str(e) or "Not Found" in str(e)) else "unknown"
-        return "unknown"  # enabled, but this token cannot read the alerts
+            if "404" not in str(e) and "Not Found" not in str(e):
+                return "unknown"
+        try:
+            admin = self._gh("api", f"repos/{repo}", "--jq", ".permissions.admin // false")
+        except GitHubError:
+            return "unknown"
+        return "disabled" if admin.strip() == "true" else "unknown"
 
-    def base_checks(self, repo: str, ref: str) -> Dict[str, Dict[str, str]]:
-        """Latest result per check name on `ref`'s head: {name: {state, at}}.
+    def base_checks(self, repo: str, ref: str) -> Optional[Dict[Tuple[str, str], Dict[str, str]]]:
+        """Latest result per (workflow, check name) on `ref`'s head commit.
 
-        state is 'pass' | 'fail' | 'pending' | 'skipped'. Uses checks:read / statuses:read
-        only — no workflow logs are read, so nothing log-derived reaches the
-        public digest.
+        Returns None if the ref does not resolve, {} if it has no checks, else
+        {(workflow, name): {'state': pass|fail|pending|skipped, 'at': iso}}.
+        Uses the commit's status rollup (checks/statuses read only) — no
+        workflow logs are read, so nothing log-derived reaches the digest.
         """
-        runs = self._gh("api", "--paginate", f"repos/{repo}/commits/{ref}/check-runs?per_page=100",
-                        "--jq", '.check_runs[] | "\(.name)\t\(.status)\t'
-                                '\(.conclusion)\t\(.completed_at // .started_at)"')
-        statuses = self._gh("api", f"repos/{repo}/commits/{ref}/status",
-                            "--jq", '.statuses[] | "\(.context)\tcompleted\t'
-                                    '\(.state)\t\(.updated_at)"')
-        latest: Dict[str, Dict[str, str]] = {}
-        for line in (runs + "\n" + statuses).splitlines():
-            parts = line.split("\t")
-            if len(parts) != 4:
+        owner, name = repo.split("/", 1)
+        out = self._gh("api", "graphql", "-f", f"query={_BASE_QUERY}",
+                       "-f", f"o={owner}", "-f", f"n={name}", "-f", f"r={ref}")
+        commit = ((json.loads(out).get("data") or {}).get("repository") or {}).get("object")
+        if not commit:
+            return None
+        nodes = ((commit.get("statusCheckRollup") or {}).get("contexts") or {}).get("nodes") or []
+        latest: Dict[Tuple[str, str], Dict[str, str]] = {}
+        for c in nodes:
+            if not c:
                 continue
-            name, status, conclusion, at = parts
-            if status != "completed" or conclusion in ("pending", "null", ""):
-                state = "pending"
-            elif conclusion in ("success", "neutral"):
-                state = "pass"
-            elif conclusion == "skipped":
-                state = "skipped"  # did not run on base: proves nothing either way
+            if c.get("__typename") == "StatusContext":
+                key = ("", c.get("context") or "?")
+                raw = (c.get("state") or "").upper()
+                state = "pass" if raw == "SUCCESS" else \
+                    "pending" if raw in ("PENDING", "EXPECTED") else "fail"
+                at = c.get("createdAt") or ""
             else:
-                state = "fail"
-            if name not in latest or at > latest[name]["at"]:
-                latest[name] = {"state": state, "at": at}
+                workflow = (((c.get("checkSuite") or {}).get("workflowRun") or {})
+                            .get("workflow") or {}).get("name") or ""
+                key = (workflow, c.get("name") or "?")
+                conclusion = (c.get("conclusion") or "").upper()
+                if (c.get("status") or "").upper() != "COMPLETED":
+                    state = "pending"
+                elif conclusion in ("SUCCESS", "NEUTRAL"):
+                    state = "pass"
+                elif conclusion == "SKIPPED":
+                    state = "skipped"  # did not run on base: proves nothing either way
+                else:
+                    state = "fail"
+                at = c.get("completedAt") or c.get("startedAt") or ""
+            if key not in latest or at > latest[key]["at"]:
+                latest[key] = {"state": state, "at": at}
         return latest
 
     def merge(self, repo: str, number: int, head_sha: str) -> None:

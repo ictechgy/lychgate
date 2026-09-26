@@ -174,9 +174,19 @@ class EvaluateTest(unittest.TestCase):
         v = self.verdict(statusCheckRollup=red, baseRefName="main",
                          headRefName="dependabot/github_actions/github/codeql-action/init-4.38.0",
                          title="chore(deps): bump github/codeql-action/init from 4.37.6 to 4.38.0")
-        self.assertEqual(v.failing_checks, ["test (macos-15)"])
+        self.assertEqual(v.failing_checks, [("", "test (macos-15)")])
         self.assertEqual((v.ecosystem, v.dep, v.target, v.base_ref),
                          ("github-actions", "github/codeql-action/init", "4.38.0", "main"))
+
+    def test_checks_are_keyed_by_workflow(self):
+        rollup = [{"__typename": "CheckRun", "name": "test", "workflowName": "ci",
+                   "status": "COMPLETED", "conclusion": "FAILURE"},
+                  {"__typename": "CheckRun", "name": "test", "workflowName": "release",
+                   "status": "COMPLETED", "conclusion": "SUCCESS"},
+                  {"__typename": "StatusContext", "context": "legacy", "state": "SUCCESS"}]
+        v = self.verdict(statusCheckRollup=rollup)
+        self.assertEqual(v.failing_checks, [("ci", "test")])
+        self.assertEqual(v.passing_checks, [("release", "test"), ("", "legacy")])
 
     def test_hold_beats_wait(self):
         v = self.verdict(mergeable="UNKNOWN", files=[{"path": "src/x.py"}])

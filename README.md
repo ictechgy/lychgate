@@ -22,9 +22,13 @@ A PR is merged only when **all** of these hold:
 - semver level is patch or minor (from Dependabot's `update-type`
   metadata and the title; `0.x` minor bumps count as major; unknown means hold)
 - only dependency manifests and lockfiles changed (no source, no workflows)
-- CI exists and is green (no CI means hold)
+- CI exists and is green: at least one check actually succeeded (no CI,
+  or all checks skipped, means hold)
+- every commit is authored by Dependabot, and the list of changed files
+  is not truncated
 - GitHub reports it mergeable
-- it is at least `min_pr_age_hours` old (default 72h cooling)
+- its newest commit is at least `min_pr_age_hours` old (default 72h). The clock
+  restarts when Dependabot rewrites the PR
 - this run has not spent `max_per_run` merges yet
 
 It merges with `--match-head-commit`, so if Dependabot pushes after the
@@ -32,6 +36,25 @@ evaluation, GitHub refuses the merge.
 
 Everything else is reported with the exact reason: **hold** (needs you),
 **wait** (re-checked next run), or **observe** (a tier-0 or sunset repo, summarised).
+When a hold only needs your judgment, the digest adds a copy-paste
+`gh pr merge … --match-head-commit <sha>` line pinned to the head it checked.
+
+## What the digest tells you
+
+- **Why CI is red**, with no logs read. It compares each failing check with
+  the same check on the PR's base branch head and with the other open PRs,
+  then labels the cause: `base-broken`, `sibling-split` (e.g. codeql
+  init/analyze bumped separately), a structural repo cause such as
+  `gradle-verification`, `repo-rejects-<ecosystem>`, `bump-failure`,
+  `base-stale` (the base pass is 30+ days old), or `no-base-signal`.
+- **Setup fixes** found in `.github/dependabot.yml`: ungrouped action
+  updates, groups that mix majors with patches, gradle dependency
+  verification, or a missing config.
+- **Monitoring gaps are never shown as clean.** Dependabot alerts appear as
+  an exact count (critical/high, without a patch), or as `disabled` or
+  `unknown`. More than 30 open PRs is flagged as truncated. A status that
+  only comes from the default is flagged. On a `complete` repo, "Nothing
+  pending" says installability has not been verified.
 
 ## What it cannot do
 
