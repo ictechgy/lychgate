@@ -17,6 +17,11 @@ GREEN = [
 ]
 
 
+def dependabot_commit(body=META_PATCH, when="2026-09-20T00:00:00Z"):
+    return {"messageBody": body, "committedDate": when,
+            "authors": [{"login": "dependabot[bot]"}]}
+
+
 def policy(**steward):
     entry = {"repo": "me/tool", "steward": {"status": "complete", "tier": 1, **steward}}
     return resolve({}, entry, None)
@@ -33,7 +38,7 @@ def pr(number=1, **over):
         "mergeable": "MERGEABLE",
         "headRefOid": f"sha{number}",
         "files": [{"path": "package.json"}, {"path": "package-lock.json"}],
-        "commits": [{"messageBody": META_PATCH}],
+        "commits": [dependabot_commit()],
         "statusCheckRollup": GREEN,
     }
     base.update(over)

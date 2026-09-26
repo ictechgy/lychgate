@@ -45,6 +45,9 @@ class Policy:
     max_per_run: int
     respond_after_days: int
     source: List[str] = field(default_factory=list)
+    # False when status came only from the built-in default: the owner never
+    # said this repo is complete, so the digest asks them to confirm.
+    status_explicit: bool = True
 
     @property
     def may_merge(self) -> bool:
@@ -59,6 +62,11 @@ def deep_merge(base: Dict[str, Any], over: Optional[Dict[str, Any]]) -> Dict[str
         else:
             out[k] = v
     return out
+
+
+def _declares_status(layer: Any) -> bool:
+    return isinstance(layer, dict) and isinstance(layer.get("steward"), dict) \
+        and "status" in layer["steward"]
 
 
 def load_registry(text: str) -> Dict[str, Any]:
@@ -77,6 +85,7 @@ def resolve(registry: Dict[str, Any], entry: Dict[str, Any],
             steward_yml: Optional[str]) -> Policy:
     layers = ["defaults"]
     merged = deep_merge(DEFAULTS, registry.get("defaults"))
+    declared = _declares_status(registry.get("defaults")) or _declares_status(entry)
     entry_cfg = {k: v for k, v in entry.items() if k != "repo"}
     if entry_cfg:
         merged = deep_merge(merged, entry_cfg)
@@ -88,6 +97,7 @@ def resolve(registry: Dict[str, Any], entry: Dict[str, Any],
             raise ConfigError(f"{entry['repo']}: steward.yml {e}") from e
         merged = deep_merge(merged, own)
         layers.append("steward.yml")
+        declared = declared or _declares_status(own)
 
     st, am = merged["steward"], merged["dependencies"]["automerge"]
     policy = Policy(
@@ -101,6 +111,7 @@ def resolve(registry: Dict[str, Any], entry: Dict[str, Any],
         max_per_run=int(am["max_per_run"]),
         respond_after_days=int(merged["issues"]["respond_after_days"]),
         source=layers,
+        status_explicit=declared,
     )
     if policy.status not in STATUSES:
         raise ConfigError(f"{policy.repo}: status must be one of {STATUSES}")

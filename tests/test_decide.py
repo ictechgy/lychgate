@@ -4,7 +4,7 @@ from lychgate.decide import (
     check_state, evaluate, is_dependency_file, level_from_versions, plan, semver_level,
 )
 
-from .fixtures import GREEN, META_PATCH, NOW, policy, pr
+from .fixtures import GREEN, META_PATCH, NOW, dependabot_commit, policy, pr
 
 
 class SemverTest(unittest.TestCase):
@@ -114,8 +114,9 @@ class EvaluateTest(unittest.TestCase):
         self.assertEqual(self.verdict(files=files).action, "hold")
 
     def test_foreign_commit_on_dependabot_branch_holds(self):
-        commits = [{"messageBody": META_PATCH, "authors": [{"login": "dependabot[bot]"}]},
-                   {"messageBody": "tweak", "authors": [{"login": "mallory"}]}]
+        commits = [dependabot_commit(),
+                   {"messageBody": "tweak", "committedDate": "2026-09-20T00:00:00Z",
+                    "authors": [{"login": "mallory"}]}]
         v = self.verdict(commits=commits)
         self.assertEqual(v.action, "hold")
         self.assertIn("mallory", v.reasons[0])
@@ -141,6 +142,41 @@ class EvaluateTest(unittest.TestCase):
                                       statusCheckRollup=red).owner_can_merge)
         self.assertFalse(self.verdict(mergeable="UNKNOWN", title="Bump qs from 1.0.0 to 2.0.0")
                          .owner_can_merge)
+
+    def test_cooling_restarts_when_dependabot_rewrites_the_pr(self):
+        # opened 5 days ago, but the head was force-pushed 10h ago
+        v = self.verdict(commits=[dependabot_commit(when="2026-09-25T02:00:00Z")])
+        self.assertEqual(v.action, "wait")
+        self.assertIn("head rewritten 10h ago", v.reasons[0])
+        self.assertGreater(v.age_hours, 100)  # PR age is still reported as-is
+
+    def test_all_skipped_checks_do_not_count_as_green(self):
+        skipped = [{"__typename": "CheckRun", "name": "t", "status": "COMPLETED",
+                    "conclusion": "SKIPPED"},
+                   {"__typename": "CheckRun", "name": "u", "status": "COMPLETED",
+                    "conclusion": "NEUTRAL"}]
+        self.assertEqual(check_state(skipped)[0], "noop")
+        v = self.verdict(statusCheckRollup=skipped)
+        self.assertEqual(v.action, "hold")
+        self.assertIn("no check actually ran", v.reasons[0])
+
+    def test_missing_commits_or_authors_fail_closed(self):
+        self.assertEqual(self.verdict(commits=[]).action, "hold")
+        anon = dependabot_commit()
+        anon["authors"] = []
+        v = self.verdict(commits=[anon])
+        self.assertEqual(v.action, "hold")
+        self.assertIn("no reported author", v.reasons[0])
+
+    def test_failing_checks_and_bump_facts_are_recorded(self):
+        red = [{"__typename": "CheckRun", "name": "test (macos-15)", "status": "COMPLETED",
+                "conclusion": "FAILURE"}]
+        v = self.verdict(statusCheckRollup=red, baseRefName="main",
+                         headRefName="dependabot/github_actions/github/codeql-action/init-4.38.0",
+                         title="chore(deps): bump github/codeql-action/init from 4.37.6 to 4.38.0")
+        self.assertEqual(v.failing_checks, ["test (macos-15)"])
+        self.assertEqual((v.ecosystem, v.dep, v.target, v.base_ref),
+                         ("github-actions", "github/codeql-action/init", "4.38.0", "main"))
 
     def test_hold_beats_wait(self):
         v = self.verdict(mergeable="UNKNOWN", files=[{"path": "src/x.py"}])
